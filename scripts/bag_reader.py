@@ -161,7 +161,7 @@ if __name__ == "__main__":
         PATH = os.getcwd()
 
         # Specify the path for the CSV file
-        csv_file_path = f'{PATH}/bag/aggressive_driving/drive.csv'
+        csv_file_path = f'{PATH}/bag/aggressive_driving/vicon_car_5.csv'
 
         # path to the bagfile
         bag_file = f'{PATH}/bag/aggressive_driving/aggressive_driving_0.db3'
@@ -221,5 +221,3 @@ if __name__ == "__main__":
     
         # close connection to the database
         close(conn)
-
-
