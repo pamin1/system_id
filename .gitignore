@@ -1,4 +1,6 @@
 build/
 install/
 log/
+bag/
+notebooks/
 .vscode/
