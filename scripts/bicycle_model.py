@@ -1,290 +1,308 @@
-# # Dynamic Bicycle Model with Longitudinal Load Transfer
-# 
-# This notebook implements a dynamic bicycle model that includes:
-# - Longitudinal and lateral dynamics
-# - Yaw dynamics
-# - Longitudinal load transfer effects
-# - Tire forces using simplified Pacejka magic formula
-# 
-# ## Model Parameters and Variables
-# 
-# ### State Variables
-# - X, Y: Global position coordinates
-# - ψ (psi): Yaw angle
-# - V_x: Longitudinal velocity
-# - V_y: Lateral velocity
-# - ψ_dot: Yaw rate
-# 
-# ### Input Variables
-# - δ (delta): Steering angle
-# - T: Drive/brake torque
-# 
-# ### Vehicle Parameters
-# - m: Total mass
-# - I_z: Yaw moment of inertia
-# - l_f: Distance from CG to front axle
-# - l_r: Distance from CG to rear axle
-# - h_cg: Height of center of gravity
-# - C_αf, C_αr: Cornering stiffness (front, rear)
-# 
-
 import numpy as np
-import pandas as pd
-from scipy.integrate import solve_ivp
-from scipy.interpolate import interp1d
 import matplotlib.pyplot as plt
-import os
+import pandas as pd
+from scipy.interpolate import interp1d
+from scipy.optimize import minimize
+import copy
 
-PATH = os.getcwd()
-vicon_csv = f'{PATH}/bag/aggressive_driving/vicon_car_5.csv'
-drive_csv = f'{PATH}/bag/aggressive_driving/drive.csv'
-
-# Vehicle parameters (example values for a passenger car)
-class VehicleParams:
-    def __init__(self):
-        # Mass and inertia
-        self.m = 3.74  # Total mass [kg]
-        self.I_z = 0.04763  # Yaw moment of inertia [kg⋅m²]
-        
-        # Geometric parameters
-        self.l_f = 0.183  # Distance from CG to front axle [m]
-        self.l_r = 0.148  # Distance from CG to rear axle [m]
-        self.h_cg = 0.20 # CG height [m]
-        self.wheelbase = self.l_f + self.l_r
-        
-        # Tire parameters (simplified)
-        self.C_af = 4.7180  # Front cornering stiffness [N/rad]
-        self.C_ar = 5.4562  # Rear cornering stiffness [N/rad]
-        
-        # Tire parameters
-        self.mu = 1.0  # Friction coefficient
-        self.g = 9.81  # Gravity [m/s²]
-
-vehicle = VehicleParams()
-
-def calculate_tire_forces(state, delta, Fx_request, vehicle):
+class DynamicBicycleModel:
     """
-    Returns longitudinal & lateral forces at each axle.
-    Fx_request: desired total longitudinal force (+drive, -brake) [N]
-                Positive = acceleration.
+    Python implementation of a dynamic bicycle model, including longitudinal
+    load transfer and friction ellipse constraints.
     """
-    _, _, _, Vx, Vy, r = state
-    m, g = vehicle.m, vehicle.g
-    lf, lr = vehicle.l_f, vehicle.l_r
-    L = lf + lr
+    def __init__(self, m, lf, lr, Iz, Cf, Cr, wheelbase, h_cg, mu=1.0, g=9.81):
+        # Vehicle parameters
+        self.m = m          # mass [kg]
+        self.lf = lf        # distance from CG to front axle [m]
+        self.lr = lr        # distance from CG to rear axle [m]
+        self.Iz = Iz        # yaw moment of inertia [kg·m²]
+        self.Cf = Cf        # front cornering stiffness [N/rad]
+        self.Cr = Cr        # rear cornering stiffness [N/rad]
+        self.wheelbase = wheelbase # wheelbase [m]
+        self.h_cg = h_cg    # height of center of gravity [m]
+        self.mu = mu        # coefficient of friction
+        self.g = g          # acceleration due to gravity [m/s^2]
 
-    # slip angles
-    if abs(Vx) > 0.1:
-        alpha_f = np.arctan2(Vy + lf * r, Vx) - delta
-        alpha_r = np.arctan2(Vy - lr * r, Vx)
+        # State variables [x, y, yaw, vx, vy, yaw_rate]
+        self.x = 0.0        # global x position [m]
+        self.y = 0.0        # global y position [m]
+        self.yaw = 0.0      # yaw angle [rad]
+        self.vx = 0.0       # longitudinal velocity (body frame) [m/s]
+        self.vy = 0.0       # lateral velocity (body frame) [m/s]
+        self.yaw_rate = 0.0 # yaw rate [rad/s]
+
+    def set_initial_state(self, x, y, yaw, vx, vy, yaw_rate):
+        self.x = x
+        self.y = y
+        self.yaw = yaw
+        self.vx = vx
+        self.vy = vy
+        self.yaw_rate = yaw_rate
+
+    def _calculate_tire_forces(self, Fx_request, delta):
+        # Distribute longitudinal force (front-wheel drive assumption)
+        Fx_f = Fx_request
+        Fx_r = 0.0
+
+        # Calculate longitudinal acceleration for load transfer (using requested force)
+        ax = Fx_request / self.m
+
+        # Calculate vertical tire forces with load transfer
+        Fz_f = self.m * self.g * self.lr / self.wheelbase - self.m * self.h_cg * ax / self.wheelbase
+        Fz_r = self.m * self.g * self.lf / self.wheelbase + self.m * self.h_cg * ax / self.wheelbase
+        Fz_f = max(0, Fz_f) # Prevent negative normal force
+        Fz_r = max(0, Fz_r)
+
+        # Calculate slip angles
+        if abs(self.vx) < 0.1:
+            alpha_f = 0.0
+            alpha_r = 0.0
+        else:
+            alpha_f = np.arctan2(self.vy + self.lf * self.yaw_rate, self.vx) - delta
+            alpha_r = np.arctan2(self.vy - self.lr * self.yaw_rate, self.vx)
+
+        # Calculate potential lateral forces (linear tire model)
+        Fy_f_potential = -self.Cf * alpha_f
+        Fy_r_potential = -self.Cr * alpha_r
+
+        # Apply friction ellipse constraints
+        # Front tire
+        F_friction_f_max = self.mu * Fz_f
+        Fx_f = np.clip(Fx_f, -F_friction_f_max, F_friction_f_max)
+        Fy_f_max_available = np.sqrt(max(0, F_friction_f_max**2 - Fx_f**2))
+        Fy_f = np.clip(Fy_f_potential, -Fy_f_max_available, Fy_f_max_available)
+
+        # Rear tire
+        F_friction_r_max = self.mu * Fz_r
+        Fy_r = np.clip(Fy_r_potential, -F_friction_r_max, F_friction_r_max)
+
+        return Fx_f, Fx_r, Fy_f, Fy_r
+
+    def step(self, Fx_request, delta, dt):
+        """
+        Updates the vehicle state for one time step dt.
+        This model uses a full dynamic state and includes load transfer.
+
+        :param Fx_request: Requested total longitudinal force [N]
+        :param delta: steering angle [rad]
+        :param dt: time step [s]
+        """
+        # Get tire forces with load transfer and friction constraints
+        Fx_f, Fx_r, Fy_f, Fy_r = self._calculate_tire_forces(Fx_request, delta)
+
+        # Equations of Motion (body frame)
+        vx_dot = (Fx_f * np.cos(delta) - Fy_f * np.sin(delta) + Fx_r) / self.m + self.vy * self.yaw_rate
+        vy_dot = (Fx_f * np.sin(delta) + Fy_f * np.cos(delta) + Fy_r) / self.m - self.vx * self.yaw_rate
+        yaw_rate_dot = (self.lf * (Fx_f * np.sin(delta) + Fy_f * np.cos(delta)) - self.lr * Fy_r) / self.Iz
+
+        # Integrate vehicle state
+        self.vx += vx_dot * dt
+        self.vy += vy_dot * dt
+        self.yaw_rate += yaw_rate_dot * dt
+
+        # Global frame kinematics
+        x_dot = self.vx * np.cos(self.yaw) - self.vy * np.sin(self.yaw)
+        y_dot = self.vx * np.sin(self.yaw) + self.vy * np.cos(self.yaw)
+        
+        # Integrate global pose
+        self.x += x_dot * dt
+        self.y += y_dot * dt
+        self.yaw += self.yaw_rate * dt
+
+        return self.x, self.y, self.yaw, self.vx, self.vy, self.yaw_rate
+
+def run_simulation(model, t_span, dt, speed_interp, steering_interp):
+    """
+    Runs the simulation for a given model and returns the trajectory history.
+    Uses a P-controller to track a target speed.
+    """
+    history = {
+        't': [], 'x': [], 'y': [], 'yaw': [], 'vx': [], 'vy': [], 'yaw_rate': [], 
+        'speed_input': [], 'steering_input': []
+    }
+    
+    # Simple P-controller for speed
+    Kp_speed = 2.0
+
+    for t in t_span:
+        target_speed = speed_interp(t)
+        current_steering = steering_interp(t)
+        
+        # Calculate force command from P-controller
+        speed_error = target_speed - model.vx
+        Fx_request = Kp_speed * speed_error
+        
+        # Step the model
+        x, y, yaw, vx, vy, yaw_rate = model.step(Fx_request, current_steering, dt)
+        
+        history['t'].append(t)
+        history['x'].append(x)
+        history['y'].append(y)
+        history['yaw'].append(yaw)
+        history['vx'].append(vx)
+        history['vy'].append(vy)
+        history['yaw_rate'].append(yaw_rate)
+        history['speed_input'].append(target_speed)
+        history['steering_input'].append(current_steering)
+        
+    return history
+
+def objective_function(params, vehicle_params, initial_state, t_span, dt, speed_interp, steering_interp, x_actual, y_actual, time_actual):
+    """
+    Cost function for optimization. Calculates the root-mean-square error
+    between simulated and actual trajectory.
+    """
+    # Unpack parameters to be optimized
+    Cf, Cr = params
+    
+    # Create a copy of the vehicle params and update it
+    opt_vehicle_params = copy.deepcopy(vehicle_params)
+    opt_vehicle_params['Cf'] = Cf
+    opt_vehicle_params['Cr'] = Cr
+    
+    # Create model with new params
+    model = DynamicBicycleModel(**opt_vehicle_params)
+    model.set_initial_state(*initial_state)
+
+    # Run simulation
+    sim_history = run_simulation(model, t_span, dt, speed_interp, steering_interp)
+
+    # Check for invalid simulation results (NaN, Inf)
+    sim_x = np.array(sim_history['x'])
+    if np.any(np.isnan(sim_x)) or np.any(np.isinf(sim_x)):
+        return 1e12  # Large penalty for instability
+
+    # Interpolate actual data to simulation time points for comparison
+    x_actual_interp = np.interp(sim_history['t'], time_actual, x_actual)
+    y_actual_interp = np.interp(sim_history['t'], time_actual, y_actual)
+
+    # Calculate Root Mean Square Error for position
+    error_x = sim_x - x_actual_interp
+    error_y = np.array(sim_history['y']) - y_actual_interp
+    rms_error = np.sqrt(np.mean(error_x**2 + error_y**2))
+    
+    # Add a penalty for very large errors, which also indicates instability
+    if rms_error > 500:  # If trajectory is off by >500m, it's unstable
+        return 1e12
+        
+    return rms_error
+
+def main():
+    """
+    Main function to load data, run optimization to fit model parameters,
+    and plot the final comparison.
+    """
+    # Load data from CSV
+    try:
+        csv_path = 'bag/aggressive_driving/synchronized_data.csv'
+        data = pd.read_csv(csv_path)
+    except FileNotFoundError:
+        print(f"Error: The file {csv_path} was not found.")
+        return
+
+    # Process data
+    time_csv = ((data['timestamp'] - data['timestamp'].iloc[0]) / 1e9).to_numpy()
+    speed_csv = data['speed'].to_numpy()
+    steering_csv = data['steering_angle'].to_numpy()
+    x_actual = data['pos_x'].to_numpy()
+    y_actual = data['pos_y'].to_numpy()
+    yaw_actual = data['yaw'].to_numpy()
+
+    # Create interpolation functions for control inputs
+    speed_interp = interp1d(time_csv, speed_csv, kind='linear', fill_value="extrapolate")
+    steering_interp = interp1d(time_csv, steering_csv, kind='linear', fill_value="extrapolate")
+
+    # Initial vehicle parameters (base for optimization)
+    vehicle_params = {
+        'm': 3.74, 'lf': 0.183, 'lr': 0.148, 'Iz': 0.04763,
+        'Cf': 4.718, 'Cr': 5.4562, 'wheelbase': 0.183 + 0.148,
+        'h_cg': 0.20, 'mu': 0.8
+    }
+
+    # Set initial state from data
+    # Assume vehicle starts with zero lateral velocity and yaw rate
+    initial_vx = speed_csv[0] if len(speed_csv) > 0 else 0
+    initial_state = (x_actual[0], y_actual[0], yaw_actual[0], initial_vx, 0.0, 0.0)
+    
+    # --- Parameter Optimization ---
+    initial_params = [vehicle_params['Cf'], vehicle_params['Cr']]
+    param_bounds = [(0.1, 20.0), (0.1, 20.0)] 
+
+    # Simulation time parameters
+    dt = 0.01
+    sim_time = time_csv[-1]
+    t_span = np.arange(0, sim_time, dt)
+
+    print("Starting parameter optimization...")
+    result = minimize(
+        objective_function,
+        initial_params,
+        args=(vehicle_params, initial_state, t_span, dt, speed_interp, steering_interp, x_actual, y_actual, time_csv),
+        method='Nelder-Mead',
+        options={'disp': True, 'xatol': 1e-4, 'fatol': 1e-4}
+    )
+
+    if result.success:
+        optimized_params = result.x
+        vehicle_params['Cf'] = optimized_params[0]
+        vehicle_params['Cr'] = optimized_params[1]
+        print("\nOptimization successful.")
+        print(f"Final cost (RMSE): {result.fun:.4f} m")
+        print(f"Optimized Cf: {vehicle_params['Cf']:.4f} N/rad")
+        print(f"Optimized Cr: {vehicle_params['Cr']:.4f} N/rad")
     else:
-        alpha_f = alpha_r = 0.0
+        print("\nOptimization failed. Using initial parameters.")
+        print(result.message)
+    # --- End of Optimization ---
 
-    # split longitudinal force
-    Fx_f = Fx_request   # all drive/brake on front axle
-    Fx_r = 0.0
+    # Run final simulation with the best parameters
+    print("\nRunning final simulation with optimized parameters...")
+    final_model = DynamicBicycleModel(**vehicle_params)
+    final_model.set_initial_state(*initial_state)
+    history = run_simulation(final_model, t_span, dt, speed_interp, steering_interp)
 
-    # load transfer
-    ax = (Fx_f + Fx_r) / m
-    dFz =  m * vehicle.h_cg * ax / L
+    # Plotting results
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle('Optimized Dynamic Bicycle Model vs. Actual Data', fontsize=16)
 
-    Fz_f = m * g * (lr / L) - dFz
-    Fz_r = m * g * (lf / L) + dFz
+    # Trajectory plot
+    axes[0, 0].plot(history['x'], history['y'], 'b-', label='Simulated Trajectory (Optimized)')
+    axes[0, 0].plot(x_actual, y_actual, 'r--', label='Actual Trajectory (CSV)')
+    axes[0, 0].set_xlabel('X Position [m]')
+    axes[0, 0].set_ylabel('Y Position [m]')
+    axes[0, 0].set_title('Vehicle Trajectory Comparison')
+    axes[0, 0].axis('equal')
+    axes[0, 0].legend()
 
-    # lateral tire forces
-    Fy_f = -vehicle.C_af * alpha_f
-    Fy_r = -vehicle.C_ar * alpha_r
-
-    # friction saturation
-    mu = vehicle.mu
-    Fy_f = np.clip(Fy_f, -mu * Fz_f,  mu * Fz_f)
-    Fy_r = np.clip(Fy_r, -mu * Fz_r,  mu * Fz_r)
-
-    return Fx_f, Fx_r, Fy_f, Fy_r, Fz_f, Fz_r
-
-
-def bicycle_model_dynamics(t, state, delta, Fx_request, vehicle):
-    """
-    EoM for a load-transfer bicycle (body-frame).
-    state = [X, Y, psi, Vx, Vy, r]
-    """
-    X, Y, psi, Vx, Vy, r = state
-    m, Iz = vehicle.m, vehicle.I_z
-    lf, lr = vehicle.l_f, vehicle.l_r
-
-    # get tire forces
-    Fx_f, Fx_r, Fy_f, Fy_r, *_ = calculate_tire_forces(
-        state, delta, Fx_request, vehicle
-    )
-
-    # get translational dynamics
-    Vx_dot = (Fx_f * np.cos(delta) - Fy_f * np.sin(delta) + Fx_r) / m + Vy * r
-    Vy_dot = (Fx_f * np.sin(delta) + Fy_f * np.cos(delta) + Fy_r) / m - Vx * r
-
-    # yaw
-    r_dot = (lf * (Fx_f * np.sin(delta) + Fy_f * np.cos(delta)) - lr * Fy_r) / Iz
-
-    # inertial kinematics
-    X_dot = Vx * np.cos(psi) - Vy * np.sin(psi)
-    Y_dot = Vx * np.sin(psi) + Vy * np.cos(psi)
-    psi_dot = r
-
-    return np.array([X_dot, Y_dot, psi_dot, Vx_dot, Vy_dot, r_dot])
-
-def simulate_vehicle(t_span, initial_state, steering_interp, speed_interp, vehicle):
-    """
-    Simulate the vehicle dynamics
+    # Inputs plot
+    ax_inputs1 = axes[0, 1]
+    ax_inputs2 = ax_inputs1.twinx()
+    ax_inputs1.plot(history['t'], history['speed_input'], 'b-', label='Target Speed [m/s]')
+    ax_inputs1.plot(history['t'], history['vx'], 'b--', label='Actual Speed [m/s]')
+    ax_inputs2.plot(history['t'], np.rad2deg(history['steering_input']), 'r-', label='Steering [deg]')
+    ax_inputs1.set_xlabel('Time [s]')
+    ax_inputs1.set_ylabel('Speed [m/s]', color='b')
+    ax_inputs2.set_ylabel('Steering Angle [deg]', color='r')
+    ax_inputs1.set_title('Control Inputs (from CSV)')
+    ax_inputs1.legend(loc='upper left')
+    ax_inputs2.legend(loc='upper right')
     
-    Parameters:
-    -----------
-    t_span: tuple (t_start, t_end)
-    initial_state: list [X, Y, psi, Vx, Vy, psi_dot]
-    steering_interp: function that returns steering angle at time t
-    speed_interp: function that returns target speed at time t
-    vehicle: VehicleParams object
-    """
-    def dynamics_wrapper(t, state):
-        delta = steering_interp(t)
-        
-        # P-controller for longitudinal speed
-        Vx = state[3]
-        target_Vx = speed_interp(t)
-        Kp = 1.0  # Reduced proportional gain to prevent system stiffness
-        Fx_request = Kp * (target_Vx - Vx)
-        
-        return bicycle_model_dynamics(t, state, delta, Fx_request, vehicle)
-    
-    # Solve ODE
-    solution = solve_ivp(
-        dynamics_wrapper,
-        t_span,
-        initial_state,
-        method='BDF',
-        t_eval=np.linspace(t_span[0], t_span[1], 1000),
-        rtol=1e-6,
-        atol=1e-6
-    )
-    
-    return solution
+    # Yaw rate plot
+    axes[1, 0].plot(history['t'], np.rad2deg(history['yaw_rate']), label='Simulated yaw_rate')
+    axes[1, 0].set_xlabel('Time [s]')
+    axes[1, 0].set_ylabel('Yaw Rate [deg/s]')
+    axes[1, 0].set_title('Yaw Rate')
+    axes[1, 0].legend()
 
-def interpolate_actual_data(t_sim, actual_time, actual_data):
-    return np.interp(t_sim, actual_time, actual_data)
+    # Lateral velocity plot
+    axes[1, 1].plot(history['t'], history['vy'], label='Simulated v_y')
+    axes[1, 1].set_xlabel('Time [s]')
+    axes[1, 1].set_ylabel('Lateral Velocity [m/s]')
+    axes[1, 1].set_title('Lateral Velocity')
+    axes[1, 1].legend()
 
-# Load and process data
-drive_data = pd.read_csv(drive_csv)
-vicon_data = pd.read_csv(vicon_csv)
-
-# Convert timestamps to seconds from start
-drive_data['time'] = (drive_data['timestamp'] - drive_data['timestamp'].iloc[0]) / 1e9
-vicon_data['time'] = (vicon_data['timestamp'] - vicon_data['timestamp'].iloc[0]) / 1e9
-
-# Convert DataFrame columns to numpy arrays
-time_array = drive_data['time'].to_numpy()
-steering_array = drive_data['steering_angle'].to_numpy()
-speed_array = drive_data['speed'].to_numpy()
-
-vicon_time = vicon_data['time'].to_numpy()
-vicon_x = vicon_data['pos_x'].to_numpy()
-vicon_y = vicon_data['pos_y'].to_numpy()
-vicon_quat_z = vicon_data['quat_z'].to_numpy()
-vicon_quat_w = vicon_data['quat_w'].to_numpy()
-vicon_vel_x = vicon_data['lin_vel_x'].to_numpy()
-vicon_vel_y = vicon_data['lin_vel_y'].to_numpy()
-vicon_ang_vel_z = vicon_data['ang_vel_z'].to_numpy()
-
-# Create interpolation functions for control inputs
-steering_interp = interp1d(time_array, steering_array, 
-                          kind='linear', fill_value='extrapolate')
-speed_interp = interp1d(time_array, speed_array,
-                       kind='linear', fill_value='extrapolate')
-
-# Get simulation time span - use the shorter of the two datasets
-t_span = (0, min(time_array[-1], vicon_time[-1]))
-
-# Set initial state from Vicon data
-# Convert quaternion to yaw angle
-yaw = 2 * np.arctan2(vicon_quat_z[0], vicon_quat_w[0])
-
-initial_state = [
-    vicon_x[0],          # X
-    vicon_y[0],          # Y
-    yaw,                 # psi
-    vicon_vel_x[0],      # Vx
-    vicon_vel_y[0],      # Vy
-    vicon_ang_vel_z[0]   # psi_dot
-]
-
-# Run simulation
-print("Running simulation...")
-solution = simulate_vehicle(t_span, initial_state, steering_interp, speed_interp, vehicle)
-print("Simulation complete")
-
-# Create comparison plots
-plt.figure(figsize=(15, 10))
-
-# Plot 1: Trajectory Comparison
-plt.subplot(2, 2, 1)
-plt.plot(solution.y[0], solution.y[1], 'b-', label='Model')
-plt.plot(vicon_x, vicon_y, 'r--', label='Vicon')
-plt.plot(initial_state[0], initial_state[1], 'go', label='Start')
-plt.plot(vicon_x[-1], vicon_y[-1], 'ro', label='End')
-plt.xlabel('X Position [m]')
-plt.ylabel('Y Position [m]')
-plt.title('Vehicle Trajectory')
-plt.axis('equal')
-plt.grid(True)
-plt.legend()
-
-# Plot 2: Velocity Comparison
-plt.subplot(2, 2, 2)
-plt.plot(solution.t, solution.y[3], 'b-', label='Model v_x')
-plt.plot(solution.t, solution.y[4], 'g-', label='Model v_y')
-plt.plot(vicon_time, vicon_vel_x, 'r--', label='Vicon v_x')
-plt.plot(vicon_time, vicon_vel_y, 'm--', label='Vicon v_y')
-plt.xlabel('Time [s]')
-plt.ylabel('Velocity [m/s]')
-plt.title('Velocity Components')
-plt.grid(True)
-plt.legend()
-
-# Plot 3: Yaw Angle Comparison
-plt.subplot(2, 2, 3)
-vicon_yaw = 2 * np.arctan2(vicon_quat_z, vicon_quat_w)
-plt.plot(solution.t, np.rad2deg(solution.y[2]), 'b-', label='Model')
-plt.plot(vicon_time, np.rad2deg(vicon_yaw), 'r--', label='Vicon')
-plt.xlabel('Time [s]')
-plt.ylabel('Yaw Angle [deg]')
-plt.title('Yaw Angle')
-plt.grid(True)
-plt.legend()
-
-# Plot 4: Control Inputs
-plt.subplot(2, 2, 4)
-plt.plot(time_array, np.rad2deg(steering_array), 'b-', label='Steering')
-plt.plot(time_array, speed_array, 'r-', label='Speed')
-plt.xlabel('Time [s]')
-plt.ylabel('Steering [deg] / Speed [m/s]')
-plt.title('Control Inputs')
-plt.grid(True)
-plt.legend()
-
-plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
 plt.show()
 
-# Interpolate Vicon data to simulation time points
-x_actual = interpolate_actual_data(solution.t, vicon_time, vicon_x)
-y_actual = interpolate_actual_data(solution.t, vicon_time, vicon_y)
-vx_actual = interpolate_actual_data(solution.t, vicon_time, vicon_vel_x)
-vy_actual = interpolate_actual_data(solution.t, vicon_time, vicon_vel_y)
-
-# Calculate RMS errors
-position_error = np.sqrt((solution.y[0] - x_actual)**2 + (solution.y[1] - y_actual)**2)
-velocity_error = np.sqrt((solution.y[3] - vx_actual)**2 + (solution.y[4] - vy_actual)**2)
-
-print("\nError Metrics:")
-print(f"Mean position error: {np.mean(position_error):.3f} m")
-print(f"Max position error: {np.max(position_error):.3f} m")
-print(f"RMS position error: {np.sqrt(np.mean(position_error**2)):.3f} m")
-print(f"\nMean velocity error: {np.mean(velocity_error):.3f} m/s")
-print(f"Max velocity error: {np.max(velocity_error):.3f} m/s")
-print(f"RMS velocity error: {np.sqrt(np.mean(velocity_error**2)):.3f} m/s")
+if __name__ == '__main__':
+    main()
