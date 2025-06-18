@@ -7,10 +7,9 @@ import copy
 
 class DynamicBicycleModel:
     """
-    Python implementation of a dynamic bicycle model, including longitudinal
-    load transfer and friction ellipse constraints.
+    Python implementation of the dynamic bicycle model from vesc_to_odom_dynamical.cpp
     """
-    def __init__(self, m, lf, lr, Iz, Cf, Cr, wheelbase, h_cg, mu=1.0, g=9.81):
+    def __init__(self, m, lf, lr, Iz, Cf, Cr, wheelbase):
         # Vehicle parameters
         self.m = m          # mass [kg]
         self.lf = lf        # distance from CG to front axle [m]
@@ -19,130 +18,91 @@ class DynamicBicycleModel:
         self.Cf = Cf        # front cornering stiffness [N/rad]
         self.Cr = Cr        # rear cornering stiffness [N/rad]
         self.wheelbase = wheelbase # wheelbase [m]
-        self.h_cg = h_cg    # height of center of gravity [m]
-        self.mu = mu        # coefficient of friction
-        self.g = g          # acceleration due to gravity [m/s^2]
 
-        # State variables [x, y, yaw, vx, vy, yaw_rate]
-        self.x = 0.0        # global x position [m]
-        self.y = 0.0        # global y position [m]
+        # State variables
+        self.x = 0.0        # global x position
+        self.y = 0.0        # global y position
         self.yaw = 0.0      # yaw angle [rad]
-        self.vx = 0.0       # longitudinal velocity (body frame) [m/s]
-        self.vy = 0.0       # lateral velocity (body frame) [m/s]
-        self.yaw_rate = 0.0 # yaw rate [rad/s]
+        self.v_lat = 0.0    # lateral velocity (v) [m/s]
+        self.yaw_rate = 0.0 # yaw rate (r) [rad/s]
 
-    def set_initial_state(self, x, y, yaw, vx, vy, yaw_rate):
+    def set_initial_state(self, x, y, yaw):
         self.x = x
         self.y = y
         self.yaw = yaw
-        self.vx = vx
-        self.vy = vy
-        self.yaw_rate = yaw_rate
+        self.v_lat = 0.0
+        self.yaw_rate = 0.0
 
-    def _calculate_tire_forces(self, Fx_request, delta):
-        # Distribute longitudinal force (front-wheel drive assumption)
-        Fx_f = Fx_request
-        Fx_r = 0.0
-
-        # Calculate longitudinal acceleration for load transfer (using requested force)
-        ax = Fx_request / self.m
-
-        # Calculate vertical tire forces with load transfer
-        Fz_f = self.m * self.g * self.lr / self.wheelbase - self.m * self.h_cg * ax / self.wheelbase
-        Fz_r = self.m * self.g * self.lf / self.wheelbase + self.m * self.h_cg * ax / self.wheelbase
-        Fz_f = max(0, Fz_f) # Prevent negative normal force
-        Fz_r = max(0, Fz_r)
-
-        # Calculate slip angles
-        if abs(self.vx) < 0.1:
-            alpha_f = 0.0
-            alpha_r = 0.0
-        else:
-            alpha_f = np.arctan2(self.vy + self.lf * self.yaw_rate, self.vx) - delta
-            alpha_r = np.arctan2(self.vy - self.lr * self.yaw_rate, self.vx)
-
-        # Calculate potential lateral forces (linear tire model)
-        Fy_f_potential = -self.Cf * alpha_f
-        Fy_r_potential = -self.Cr * alpha_r
-
-        # Apply friction ellipse constraints
-        # Front tire
-        F_friction_f_max = self.mu * Fz_f
-        Fx_f = np.clip(Fx_f, -F_friction_f_max, F_friction_f_max)
-        Fy_f_max_available = np.sqrt(max(0, F_friction_f_max**2 - Fx_f**2))
-        Fy_f = np.clip(Fy_f_potential, -Fy_f_max_available, Fy_f_max_available)
-
-        # Rear tire
-        F_friction_r_max = self.mu * Fz_r
-        Fy_r = np.clip(Fy_r_potential, -F_friction_r_max, F_friction_r_max)
-
-        return Fx_f, Fx_r, Fy_f, Fy_r
-
-    def step(self, Fx_request, delta, dt):
+    def step(self, u_lon, delta, dt):
         """
-        Updates the vehicle state for one time step dt.
-        This model uses a full dynamic state and includes load transfer.
+        Updates the vehicle state for one time step dt using either a
+        kinematic or dynamic model based on speed.
 
-        :param Fx_request: Requested total longitudinal force [N]
+        :param u_lon: longitudinal velocity [m/s]
         :param delta: steering angle [rad]
         :param dt: time step [s]
         """
-        # Get tire forces with load transfer and friction constraints
-        Fx_f, Fx_r, Fy_f, Fy_r = self._calculate_tire_forces(Fx_request, delta)
 
-        # Equations of Motion (body frame)
-        vx_dot = (Fx_f * np.cos(delta) - Fy_f * np.sin(delta) + Fx_r) / self.m + self.vy * self.yaw_rate
-        vy_dot = (Fx_f * np.sin(delta) + Fy_f * np.cos(delta) + Fy_r) / self.m - self.vx * self.yaw_rate
-        yaw_rate_dot = (self.lf * (Fx_f * np.sin(delta) + Fy_f * np.cos(delta)) - self.lr * Fy_r) / self.Iz
+        # Use kinematic model at low speeds to avoid singularities in dynamic model
+        if abs(u_lon) < 0.5:
+            # Kinematic bicycle model
+            x_dot = u_lon * np.cos(self.yaw)
+            y_dot = u_lon * np.sin(self.yaw)
+            yaw_dot = u_lon * np.tan(delta) / self.wheelbase
+            
+            # At low speeds, lateral velocity is negligible
+            self.v_lat = 0.0
+            self.yaw_rate = yaw_dot
+        else:
+            # Linear dynamic bicycle model
+            # Equations for v_dot and r_dot from the C++ source
+            v_lat_dot = (-(self.Cf + self.Cr) / (self.m * u_lon) * self.v_lat -
+                         (u_lon + (self.Cf * self.lf - self.Cr * self.lr) / (self.m * u_lon)) * self.yaw_rate +
+                         (self.Cf / self.m) * delta)
+            
+            yaw_rate_dot = (-(self.Cf * self.lf - self.Cr * self.lr) / (self.Iz * u_lon) * self.v_lat -
+                            (self.Cf * self.lf**2 + self.Cr * self.lr**2) / (self.Iz * u_lon) * self.yaw_rate +
+                            (self.Cf * self.lf / self.Iz) * delta)
 
-        # Integrate vehicle state
-        self.vx += vx_dot * dt
-        self.vy += vy_dot * dt
-        self.yaw_rate += yaw_rate_dot * dt
+            # Integrate dynamic states using Euler's method
+            self.v_lat += v_lat_dot * dt
+            self.yaw_rate += yaw_rate_dot * dt
 
-        # Global frame kinematics
-        x_dot = self.vx * np.cos(self.yaw) - self.vy * np.sin(self.yaw)
-        y_dot = self.vx * np.sin(self.yaw) + self.vy * np.cos(self.yaw)
-        
-        # Integrate global pose
+            # Global frame kinematics
+            x_dot = u_lon * np.cos(self.yaw) - self.v_lat * np.sin(self.yaw)
+            y_dot = u_lon * np.sin(self.yaw) + self.v_lat * np.cos(self.yaw)
+            yaw_dot = self.yaw_rate
+
+        # Integrate pose using Euler's method
         self.x += x_dot * dt
         self.y += y_dot * dt
-        self.yaw += self.yaw_rate * dt
+        self.yaw += yaw_dot * dt
 
-        return self.x, self.y, self.yaw, self.vx, self.vy, self.yaw_rate
+        return self.x, self.y, self.yaw, self.v_lat, self.yaw_rate
 
 def run_simulation(model, t_span, dt, speed_interp, steering_interp):
     """
     Runs the simulation for a given model and returns the trajectory history.
-    Uses a P-controller to track a target speed.
     """
     history = {
-        't': [], 'x': [], 'y': [], 'yaw': [], 'vx': [], 'vy': [], 'yaw_rate': [], 
+        't': [], 'x': [], 'y': [], 'yaw': [], 'v_lat': [], 'yaw_rate': [], 
         'speed_input': [], 'steering_input': []
     }
     
-    # Simple P-controller for speed
-    Kp_speed = 2.0
-
     for t in t_span:
-        target_speed = speed_interp(t)
+        current_speed = speed_interp(t)
         current_steering = steering_interp(t)
         
-        # Calculate force command from P-controller
-        speed_error = target_speed - model.vx
-        Fx_request = Kp_speed * speed_error
-        
         # Step the model
-        x, y, yaw, vx, vy, yaw_rate = model.step(Fx_request, current_steering, dt)
+        x, y, yaw, v_lat, yaw_rate = model.step(current_speed, current_steering, dt)
         
         history['t'].append(t)
         history['x'].append(x)
         history['y'].append(y)
         history['yaw'].append(yaw)
-        history['vx'].append(vx)
-        history['vy'].append(vy)
+        history['v_lat'].append(v_lat)
         history['yaw_rate'].append(yaw_rate)
-        history['speed_input'].append(target_speed)
+        history['speed_input'].append(current_speed)
         history['steering_input'].append(current_steering)
         
     return history
@@ -215,18 +175,14 @@ def main():
     # Initial vehicle parameters (base for optimization)
     vehicle_params = {
         'm': 3.74, 'lf': 0.183, 'lr': 0.148, 'Iz': 0.04763,
-        'Cf': 4.718, 'Cr': 5.4562, 'wheelbase': 0.183 + 0.148,
-        'h_cg': 0.20, 'mu': 0.8
+        'Cf': 4.718, 'Cr': 5.4562, 'wheelbase': 0.183 + 0.148
     }
 
     # Set initial state from data
-    # Assume vehicle starts with zero lateral velocity and yaw rate
-    initial_vx = speed_csv[0] if len(speed_csv) > 0 else 0
-    initial_state = (x_actual[0], y_actual[0], yaw_actual[0], initial_vx, 0.0, 0.0)
+    initial_state = (x_actual[0], y_actual[0], yaw_actual[0])
     
     # --- Parameter Optimization ---
     initial_params = [vehicle_params['Cf'], vehicle_params['Cr']]
-    param_bounds = [(0.1, 20.0), (0.1, 20.0)] 
 
     # Simulation time parameters
     dt = 0.01
@@ -277,8 +233,7 @@ def main():
     # Inputs plot
     ax_inputs1 = axes[0, 1]
     ax_inputs2 = ax_inputs1.twinx()
-    ax_inputs1.plot(history['t'], history['speed_input'], 'b-', label='Target Speed [m/s]')
-    ax_inputs1.plot(history['t'], history['vx'], 'b--', label='Actual Speed [m/s]')
+    ax_inputs1.plot(history['t'], history['speed_input'], 'b-', label='Speed [m/s]')
     ax_inputs2.plot(history['t'], np.rad2deg(history['steering_input']), 'r-', label='Steering [deg]')
     ax_inputs1.set_xlabel('Time [s]')
     ax_inputs1.set_ylabel('Speed [m/s]', color='b')
@@ -295,14 +250,14 @@ def main():
     axes[1, 0].legend()
 
     # Lateral velocity plot
-    axes[1, 1].plot(history['t'], history['vy'], label='Simulated v_y')
+    axes[1, 1].plot(history['t'], history['v_lat'], label='Simulated v_lat')
     axes[1, 1].set_xlabel('Time [s]')
     axes[1, 1].set_ylabel('Lateral Velocity [m/s]')
     axes[1, 1].set_title('Lateral Velocity')
     axes[1, 1].legend()
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
-plt.show()
+    plt.show()
 
 if __name__ == '__main__':
     main()

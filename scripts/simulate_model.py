@@ -23,11 +23,9 @@ def main():
         'lf': 0.183,
         'lr': 0.148,
         'Iz': 0.04763,
-        'Cf': 4.9636,  # Optimized value
-        'Cr': 5.7522,  # Optimized value
-        'wheelbase': 0.183 + 0.148,
-        'h_cg': 0.20,  # Center of gravity height
-        'mu': 0.8     # Coefficient of friction
+        'Cf': 5.0275,  # Optimized value
+        'Cr': 5.3537,  # Optimized value
+        'wheelbase': 0.183 + 0.148
     }
     
     # --- Load and Process Data ---
@@ -66,42 +64,36 @@ def main():
     model = DynamicBicycleModel(**vehicle_params)
 
     # Set the initial state from the first data point
-    # Assume vehicle starts with its initial speed, but zero lateral velocity and yaw rate.
-    initial_vx = speed_actual[0] if len(speed_actual) > 0 else 0
-    model.set_initial_state(x_actual[0], y_actual[0], yaw_actual[0], initial_vx, 0.0, 0.0)
+    model.set_initial_state(x_actual[0], y_actual[0], yaw_actual[0])
     
     # Set up the simulation time
     dt = 0.01
     t_span = np.arange(0, simulation_duration, dt)
 
+    print("\nRunning simulation...")
+    
     # Data logging for simulation results
     history = {
-        't': [], 'x': [], 'y': [], 'vx': [], 'vy': [], 'yaw_rate': [],
-        'target_speed': [], 'steering_input': []
+        't': [], 'x': [], 'y': [], 'yaw': [], 'v_lat': [], 'yaw_rate': [], 
+        'speed_input': [], 'steering_input': []
     }
-
-    # Simple P-controller for speed
-    Kp_speed = 1.0
-
-    print("\nRunning simulation...")
+    
     for t in t_span:
-        target_speed = speed_interp(t)
+        current_speed = speed_interp(t)
         current_steering = steering_interp(t)
         
-        # Calculate force command from P-controller
-        speed_error = target_speed - model.vx
-        Fx_request = Kp_speed * speed_error
-        
-        x, y, _, vx, vy, yaw_rate = model.step(Fx_request, current_steering, dt)
+        # Step the model
+        x, y, yaw, v_lat, yaw_rate = model.step(current_speed, current_steering, dt)
         
         history['t'].append(t)
         history['x'].append(x)
         history['y'].append(y)
-        history['vx'].append(vx)
-        history['vy'].append(vy)
+        history['yaw'].append(yaw)
+        history['v_lat'].append(v_lat)
         history['yaw_rate'].append(yaw_rate)
-        history['target_speed'].append(target_speed)
+        history['speed_input'].append(current_speed)
         history['steering_input'].append(current_steering)
+        
     print("Simulation complete.")
 
     # --- Plotting ---
@@ -122,13 +114,12 @@ def main():
     # Inputs plot
     ax_inputs1 = axes[0, 1]
     ax_inputs2 = ax_inputs1.twinx()
-    ax_inputs1.plot(history['t'], history['target_speed'], 'b-', label='Target Speed [m/s]')
-    ax_inputs1.plot(history['t'], history['vx'], 'b--', label='Actual Speed [m/s]')
+    ax_inputs1.plot(history['t'], history['speed_input'], 'b-', label='Speed Command [m/s]')
     ax_inputs2.plot(history['t'], np.rad2deg(history['steering_input']), 'r-', label='Steering [deg]')
     ax_inputs1.set_xlabel('Time [s]')
     ax_inputs1.set_ylabel('Speed [m/s]', color='b')
     ax_inputs2.set_ylabel('Steering Angle [deg]', color='r')
-    ax_inputs1.set_title('Control Inputs & Actual Speed')
+    ax_inputs1.set_title('Control Inputs')
     ax_inputs1.legend(loc='upper left')
     ax_inputs2.legend(loc='upper right')
     
@@ -140,7 +131,7 @@ def main():
     axes[1, 0].legend()
 
     # Lateral velocity plot
-    axes[1, 1].plot(history['t'], history['vy'], label='Simulated Lateral Velocity')
+    axes[1, 1].plot(history['t'], history['v_lat'], label='Simulated Lateral Velocity')
     axes[1, 1].set_xlabel('Time [s]')
     axes[1, 1].set_ylabel('Lateral Velocity [m/s]')
     axes[1, 1].set_title('Lateral Velocity')
