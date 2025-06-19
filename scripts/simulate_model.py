@@ -1,9 +1,12 @@
 import numpy as np
 import pandas as pd
-from scipy.interpolate import interp1d
 import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
 from bicycle_model import DynamicBicycleModel
 import os
+import sys
+
+sys.path.append(os.path.dirname(__file__))
 
 def main():
     """
@@ -15,20 +18,22 @@ def main():
     csv_path = os.path.join(os.getcwd(), 'bag/aggressive_driving/synchronized_data.csv')
 
     # Define how many seconds of data to simulate
-    simulation_duration = 15.0  # seconds
+    simulation_duration = 10.0  # seconds
 
     # Vehicle parameters (use the values found from optimization)
     vehicle_params = {
         'm': 3.74,
         'lf': 0.183,
         'lr': 0.148,
-        'Iz': 0.04763,
-        'Cf': 5.0275,  # Optimized value
-        'Cr': 5.3537,  # Optimized value
-        'wheelbase': 0.183 + 0.148
+        'h_cg': 0.12,
+        'Iy': 0.02,
+        'Iz': 5.05168963e-02,
+        'Cf': 4.29062283e+02,
+        'Cr': 5.57480744e+02,
+        'alpha_sat': np.deg2rad(7.0),
     }
     
-    # --- Load and Process Data ---
+    # Load and Process Data
     try:
         data = pd.read_csv(csv_path)
     except FileNotFoundError:
@@ -56,7 +61,7 @@ def main():
     speed_interp = interp1d(time_actual, speed_actual, kind='linear', fill_value="extrapolate")
     steering_interp = interp1d(time_actual, steering_actual, kind='linear', fill_value="extrapolate")
 
-    # --- Simulation ---
+    # Simulation
     # Instantiate the model with the specified parameters
     print("Instantiating model with the following parameters:")
     for key, value in vehicle_params.items():
@@ -64,7 +69,15 @@ def main():
     model = DynamicBicycleModel(**vehicle_params)
 
     # Set the initial state from the first data point
-    model.set_initial_state(x_actual[0], y_actual[0], yaw_actual[0])
+    model.set_initial_state(
+        x_actual[0], y_actual[0],
+        yaw_actual[0],      # psi
+        speed_actual[0],    # initial u
+        0.0,                # v lateral
+        0.0,                # r yaw-rate
+        0.0,                # theta pitch
+        0.0                 # q pitch rate
+    )
     
     # Set up the simulation time
     dt = 0.01
@@ -74,7 +87,7 @@ def main():
     
     # Data logging for simulation results
     history = {
-        't': [], 'x': [], 'y': [], 'yaw': [], 'v_lat': [], 'yaw_rate': [], 
+        't': [], 'x': [], 'y': [], 'psi': [], 'v_lat': [], 'yaw_rate': [],
         'speed_input': [], 'steering_input': []
     }
     
@@ -82,13 +95,14 @@ def main():
         current_speed = speed_interp(t)
         current_steering = steering_interp(t)
         
-        # Step the model
-        x, y, yaw, v_lat, yaw_rate = model.step(current_speed, current_steering, dt)
+        # Step the model (returns full state)
+        state = model.step(current_speed, current_steering, dt)
+        x, y, psi, u, v_lat, yaw_rate, theta, q = state
         
         history['t'].append(t)
         history['x'].append(x)
         history['y'].append(y)
-        history['yaw'].append(yaw)
+        history['psi'].append(psi)
         history['v_lat'].append(v_lat)
         history['yaw_rate'].append(yaw_rate)
         history['speed_input'].append(current_speed)
@@ -96,7 +110,7 @@ def main():
         
     print("Simulation complete.")
 
-    # --- Plotting ---
+    # Plotting
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle('Dynamic Bicycle Model Simulation vs. Actual Data', fontsize=16)
 
@@ -140,7 +154,7 @@ def main():
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.show()
 
-    # --- Error Calculation ---
+    # Error Calculation
     # Interpolate actual data to simulation time points for a fair comparison
     x_actual_interp = np.interp(history['t'], time_actual, x_actual)
     y_actual_interp = np.interp(history['t'], time_actual, y_actual)
